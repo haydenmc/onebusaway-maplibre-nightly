@@ -162,9 +162,20 @@ jobs:
           SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
         run: |
           set -euo pipefail
-          src="$(find upstream/onebusaway-android/build/outputs/apk/oba/maplibre/release \
-                   -name '*.apk' -print -quit)"
-          [ -n "$src" ] || { echo "no APK produced" >&2; exit 1; }
+          # Search the whole outputs/apk tree rather than a hardcoded path: how AGP nests the two
+          # flavor dimensions (oba × maplibre) under there is an implementation detail that already
+          # cost one run. Only one variant is assembled, so exactly one APK is expected — anything
+          # else means the assumption broke again and is worth failing on rather than guessing.
+          apk_root="upstream/onebusaway-android/build/outputs/apk"
+          mapfile -t found < <(find "$apk_root" -type f -name '*.apk' | sort)
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "expected exactly 1 APK under $apk_root, found ${#found[@]}:" >&2
+            printf '  %s\n' "${found[@]:-<none>}" >&2
+            find "$apk_root" -type d >&2 || true
+            exit 1
+          fi
+          src="${found[0]}"
+          echo "found APK: $src"
 
           apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -print | sort -V | tail -1)"
           [ -n "$apksigner" ] || { echo "apksigner not found under $ANDROID_HOME" >&2; exit 1; }
