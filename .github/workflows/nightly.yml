@@ -115,11 +115,14 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.NIGHTLY_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.NIGHTLY_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.NIGHTLY_KEY_ALIAS }}
+          # Deliberately a variable, not a secret: a keystore alias isn't sensitive, and holding it
+          # as a secret made Actions redact every occurrence of that word in the logs — including
+          # the repo name and the patched package name, which made the first failure harder to read.
+          KEY_ALIAS: ${{ vars.NIGHTLY_KEY_ALIAS || 'nightly' }}
           KEY_PASSWORD: ${{ secrets.NIGHTLY_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_PASSWORD; do
             [ -n "${!v}" ] || { echo "missing secret NIGHTLY_$v" >&2; exit 1; }
           done
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nightly.jks"

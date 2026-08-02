@@ -22,6 +22,10 @@ Read this first:
   the official app, and it inherits none of its data or settings.
 - **There is no migration path back.** Moving to the official app later means starting fresh.
 - **It is built from unreviewed upstream `main`.** Some nights will be broken.
+- **Crash reporting and push notifications don't work.** Firebase is deliberately pointed at a
+  placeholder project so these builds never report into the OneBusAway project's Analytics and
+  Crashlytics. Nothing is collected about you by these builds; nothing useful reaches anyone if one
+  crashes, either.
 - Trip-planning geocoding needs a Pelias API key that these builds may not carry; the rest of the
   app is unaffected.
 
@@ -48,9 +52,12 @@ Required repo secrets:
 |---|---|
 | `NIGHTLY_KEYSTORE_BASE64` | `base64 -w0 nightly.jks` |
 | `NIGHTLY_KEYSTORE_PASSWORD` | |
-| `NIGHTLY_KEY_ALIAS` | |
-| `NIGHTLY_KEY_PASSWORD` | |
+| `NIGHTLY_KEY_PASSWORD` | same as the store password, unless you made a JKS with a distinct one |
 | `PELIAS_API_KEY` | optional; enables trip-planning geocoding |
+
+The key alias is a repo **variable**, not a secret — `NIGHTLY_KEY_ALIAS`, defaulting to `nightly`.
+Aliases aren't sensitive, and making one a secret causes Actions to redact that word everywhere it
+appears in a log, which is miserable to debug when the alias is a common word.
 
 Generate the keystore once and **back it up** — if it is lost, every user has to uninstall and
 reinstall to keep receiving nightlies:

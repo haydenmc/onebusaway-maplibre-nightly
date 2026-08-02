@@ -28,6 +28,8 @@ readonly ROOT="$1"
 
 readonly BUILD_GRADLE="$ROOT/onebusaway-android/build.gradle.kts"
 readonly VALUES_DIR="$ROOT/onebusaway-android/src/main/res"
+readonly OBA_FLAVOR="$ROOT/onebusaway-android/flavors/oba.gradle"
+readonly GOOGLE_SERVICES="$ROOT/onebusaway-android/google-services.json"
 
 # --- validate everything before mutating anything ------------------------------------------------
 #
@@ -43,6 +45,14 @@ grep -q 'applicationIdSuffix' "$BUILD_GRADLE" &&
 mapfile -t name_files < <(grep -rl --include='strings.xml' '<string name="app_name">' "$VALUES_DIR")
 [ ${#name_files[@]} -gt 0 ] ||
     die "no strings.xml defines app_name under $VALUES_DIR — upstream layout changed"
+
+[ -f "$GOOGLE_SERVICES" ] || die "missing $GOOGLE_SERVICES"
+[ -f "$OBA_FLAVOR" ] || die "missing $OBA_FLAVOR"
+# Read the brand's applicationId rather than hardcoding it, so a rename upstream doesn't silently
+# produce a google-services.json whose client matches nothing.
+base_app_id="$(sed -n 's/^[[:space:]]*applicationId[[:space:]]*"\([^"]*\)".*/\1/p' "$OBA_FLAVOR")"
+[ -n "$base_app_id" ] || die "no applicationId found in $OBA_FLAVOR — upstream layout changed"
+readonly PACKAGE_NAME="${base_app_id}${APP_ID_SUFFIX}"
 
 # --- 1. applicationId + versionName suffixes -----------------------------------------------------
 #
@@ -60,6 +70,13 @@ android {
         getByName("release") {
             applicationIdSuffix = "$APP_ID_SUFFIX"
             versionNameSuffix = "$VERSION_NAME_SUFFIX"
+
+            // The placeholder google-services.json below points at a Firebase project nobody owns,
+            // so a mapping upload could only fail the build. Deobfuscation isn't useful here anyway:
+            // nothing is receiving these crash reports.
+            configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                mappingFileUploadEnabled = false
+            }
         }
     }
 }
@@ -80,3 +97,52 @@ for f in "${name_files[@]}"; do
         die "app_name rewrite did not take effect in $f"
 done
 echo "patch-nightly: renamed app_name to '$APP_NAME' in ${#name_files[@]} file(s)"
+
+# --- 3. Firebase ---------------------------------------------------------------------------------
+#
+# Two reasons this file has to be replaced rather than left alone:
+#
+#   1. The google-services plugin hard-fails when no client matches the variant's applicationId, and
+#      ours is suffixed. That's what broke the first run of this workflow.
+#   2. Upstream's file points at the real OneBusAway Firebase project. Reusing it would send crash
+#      reports and analytics from unofficial builds of patched source into the maintainers'
+#      dashboards — data they can't reproduce and didn't ask for, at nightly-distribution scale.
+#
+# So: a self-consistent placeholder project owned by nobody. Firebase initializes normally (no
+# startup crash), and Analytics/Crashlytics/Messaging simply have nowhere to talk to. Push
+# notifications and crash reporting do not work in nightly builds. That is the intended trade.
+
+cat > "$GOOGLE_SERVICES" <<EOF
+{
+  "project_info": {
+    "project_number": "000000000000",
+    "project_id": "onebusaway-maplibre-nightly-placeholder",
+    "storage_bucket": "onebusaway-maplibre-nightly-placeholder.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+        "android_client_info": {
+          "package_name": "$PACKAGE_NAME"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyPLACEHOLDER0000000000000000000000000"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
+EOF
+python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$GOOGLE_SERVICES" ||
+    die "generated $GOOGLE_SERVICES is not valid JSON"
+echo "patch-nightly: replaced google-services.json with a placeholder for $PACKAGE_NAME"

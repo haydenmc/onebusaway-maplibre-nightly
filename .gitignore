@@ -2,7 +2,12 @@
 /upstream/
 *.apk
 
-# Signing material must never be committed — it lives in GitHub secrets
+# Signing material must never be committed — it lives in GitHub secrets.
+# The base64 encoding of a keystore is the keystore; ignore it just as hard.
 *.jks
 *.keystore
+*.base64
 secure.properties
+
+# Failure logs pasted in for debugging
+*.log
