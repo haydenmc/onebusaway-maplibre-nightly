@@ -1,0 +1,241 @@
+name: Nightly MapLibre Build
+
+# Builds the `obaMaplibreRelease` variant of OneBusAway/onebusaway-android from upstream main and
+# publishes it as a prerelease. Upstream is never forked: it's checked out fresh each run and patched
+# in place by scripts/patch-nightly.sh, so this repo carries no copy of their source to keep in sync.
+#
+# Runs on plain ubuntu-latest rather than an Android SDK container — the runner image already has the
+# SDK, and this mirrors upstream's own .github/workflows/android.yml (JDK 21 temurin +
+# gradle/actions/setup-gradle), which is the toolchain proven against this exact build. Action
+# versions are pinned to match theirs for the same reason.
+
+on:
+  schedule:
+    # 8pm Pacific. The per-schedule `timezone` key follows DST, so this stays at 20:00 local
+    # year-round rather than drifting an hour the way a UTC-only cron would.
+    - cron: '0 20 * * *'
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build and release even if upstream main has not moved'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # create releases
+
+# One nightly at a time; a manual dispatch overlapping the cron cancels the stale run rather than
+# racing it on the Gradle cache.
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: OneBusAway/onebusaway-android
+  UPSTREAM_BRANCH: main
+  VARIANT: obaMaplibreRelease
+  KEEP_RELEASES: '14'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" \
+                   "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)"
+          [ -n "$sha" ] || { echo "could not resolve ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}" >&2; exit 1; }
+          {
+            echo "sha=$sha"
+            echo "short_sha=${sha:0:7}"
+            echo "date=$(date -u +%Y-%m-%d)"
+            echo "tag_date=$(date -u +%Y.%m.%d)"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream ${UPSTREAM_BRANCH} is at $sha"
+
+      # Nothing changed upstream means nothing new to ship; a fresh prerelease every night would be
+      # noise for anyone watching the release feed. Existing tags carry the short SHA, so they are
+      # the record of what has already been built.
+      - name: Skip if already released
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = "true" ]; then
+            echo "forced: building regardless of existing releases"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release list --limit 50 --json tagName --jq '.[].tagName' \
+               | grep -qx ".*-${SHORT_SHA}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream is unchanged at \`${SHORT_SHA}\` — nothing to build." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Setup Java
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Gradle cache
+        if: steps.skip.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v6
+
+      # Upstream's release signingConfig is empty unless a `secure.properties` gradle property points
+      # at a real file (see their build.gradle.kts) — without this the APK builds fine but comes out
+      # unsigned and uninstallable. Both files live in RUNNER_TEMP, outside the checkout, so a stray
+      # `assemble` can never package them.
+      - name: Write signing config
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.NIGHTLY_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.NIGHTLY_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NIGHTLY_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.NIGHTLY_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || { echo "missing secret NIGHTLY_$v" >&2; exit 1; }
+          done
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nightly.jks"
+          chmod 600 "$RUNNER_TEMP/nightly.jks"
+          # Written with printf rather than a heredoc so no YAML block indentation leaks into the
+          # values. Absolute path with forward slashes: upstream resolves key.store with file(),
+          # which is relative to the module directory otherwise.
+          umask 077
+          printf 'key.store=%s\nkey.alias=%s\nkey.storepassword=%s\nkey.keypassword=%s\n' \
+            "$RUNNER_TEMP/nightly.jks" "$KEY_ALIAS" "$KEYSTORE_PASSWORD" "$KEY_PASSWORD" \
+            > "$RUNNER_TEMP/secure.properties"
+
+      - name: Patch for side-by-side install
+        if: steps.skip.outputs.skip != 'true'
+        run: ./scripts/patch-nightly.sh upstream
+
+      # Pelias_oba is optional — upstream's getPeliasKey() falls back to "" and only trip-planning
+      # geocoding degrades, so an unset secret still produces a working app.
+      - name: Build ${{ env.VARIANT }}
+        if: steps.skip.outputs.skip != 'true'
+        working-directory: upstream
+        env:
+          PELIAS_API_KEY: ${{ secrets.PELIAS_API_KEY }}
+        run: |
+          set -euo pipefail
+          ./gradlew ":onebusaway-android:assemble${VARIANT^}" \
+            "-Psecure.properties=$RUNNER_TEMP/secure.properties" \
+            "-PPelias_oba=${PELIAS_API_KEY}" \
+            --build-cache --stacktrace
+
+      # The failure this guards against is silent: an unsigned APK is a perfectly successful Gradle
+      # build that produces something nobody can install. Never publish without checking.
+      - name: Verify signature and stage APK
+        if: steps.skip.outputs.skip != 'true'
+        id: apk
+        env:
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          src="$(find upstream/onebusaway-android/build/outputs/apk/oba/maplibre/release \
+                   -name '*.apk' -print -quit)"
+          [ -n "$src" ] || { echo "no APK produced" >&2; exit 1; }
+
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -print | sort -V | tail -1)"
+          [ -n "$apksigner" ] || { echo "apksigner not found under $ANDROID_HOME" >&2; exit 1; }
+          "$apksigner" verify --print-certs "$src"
+
+          # Filename is set by upstream as <variant>-v<versionName>.apk, and versionName now carries
+          # our suffix — so derive the version from it rather than assuming either shape.
+          version="$(basename "$src" .apk | sed 's/^.*-v//')"
+          out="onebusaway-oba-maplibre-${version}-${SHORT_SHA}.apk"
+          cp "$src" "$out"
+          {
+            echo "path=$out"
+            echo "version=$version"
+            echo "sha256=$(sha256sum "$out" | cut -d' ' -f1)"
+            echo "fingerprint=$("$apksigner" verify --print-certs "$out" \
+                                 | grep -m1 -i 'certificate SHA-256 digest' | awk '{print $NF}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create prerelease
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+          DATE: ${{ steps.upstream.outputs.date }}
+          TAG_DATE: ${{ steps.upstream.outputs.tag_date }}
+          APK: ${{ steps.apk.outputs.path }}
+          VERSION: ${{ steps.apk.outputs.version }}
+          SHA256: ${{ steps.apk.outputs.sha256 }}
+          FINGERPRINT: ${{ steps.apk.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          # sed strips this block's YAML indentation; left in, every line would render as an
+          # indented code block instead of Markdown.
+          notes="$(sed 's/^          //' <<EOF
+          Unofficial nightly build of the **maplibre** flavor of [OneBusAway for Android](https://github.com/${UPSTREAM_REPO}).
+          Not affiliated with or endorsed by the OneBusAway project.
+
+          | | |
+          |---|---|
+          | Upstream commit | [\`${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${SHA}) |
+          | Built | ${DATE} (UTC) |
+          | Variant | \`${VARIANT}\` |
+          | Version | ${VERSION} |
+          | APK SHA-256 | \`${SHA256}\` |
+          | Signing cert SHA-256 | \`${FINGERPRINT}\` |
+
+          **Before installing:** this is signed with a key belonging to this repo, not the OneBusAway
+          project, and its application ID carries a \`.maplibre.nightly\` suffix. It installs
+          alongside the Play Store app as **OneBusAway (Libre)** rather than upgrading it, and
+          carries over no data or settings. Built from unreviewed upstream \`main\`, so expect the
+          occasional broken night.
+          EOF
+          )"
+          gh release create "nightly-${TAG_DATE}-${SHORT_SHA}" "$APK" \
+            --title "Nightly ${DATE} (${SHORT_SHA})" \
+            --notes "$notes" \
+            --prerelease
+
+      # Keep the release list navigable. Old nightlies have no value once a newer one exists — the
+      # upstream commit they were built from is still in upstream's history either way. Non-fatal:
+      # a failed prune must not fail a build that already published successfully.
+      - name: Prune old releases
+        if: steps.skip.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName,createdAt,isPrerelease \
+            --jq '[.[] | select(.isPrerelease)] | sort_by(.createdAt) | reverse
+                  | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' \
+            | while read -r tag; do
+                [ -n "$tag" ] || continue
+                echo "deleting $tag"
+                gh release delete "$tag" --cleanup-tag --yes
+              done

@@ -1,0 +1,8 @@
+# Upstream checkout + build artifacts, when running the workflow steps locally
+/upstream/
+*.apk
+
+# Signing material must never be committed — it lives in GitHub secrets
+*.jks
+*.keystore
+secure.properties
