@@ -11,15 +11,13 @@ name: Nightly MapLibre Build
 
 on:
   schedule:
-    # 8:17pm Pacific. The per-schedule `timezone` key follows DST, so this stays at 20:17 local
+    # 5:17pm Pacific. The per-schedule `timezone` key follows DST, so this stays at 17:17 local
     # year-round rather than drifting an hour the way a UTC-only cron would.
     #
     # The odd minute is deliberate. GitHub's scheduler is shared infrastructure and runs late under
     # load — 15 minutes to 2+ hours — and the top of the hour is the worst slot, since every
-    # `0 * * * *` cron on the platform queues up there at once. 20:00 Pacific converts to 03:00 UTC,
-    # landing squarely in that pileup. Offsetting into the hour dodges it. Delay is still possible
-    # and GitHub may drop a scheduled run outright, which is what workflow_dispatch is here for.
-    - cron: '17 20 * * *'
+    # `0 * * * *` cron on the platform queues up there at once.
+    - cron: '17 17 * * *'
       timezone: America/Los_Angeles
   workflow_dispatch:
     inputs:
